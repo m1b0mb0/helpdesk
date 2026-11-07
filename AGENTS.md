@@ -4,7 +4,9 @@
 
 This repository implements the take-home assignment described in `docs/ASSIGNMENT.md`. The original employer-provided assignment takes precedence if there is any discrepancy. Keep the solution proportional to a small, time-boxed backend exercise.
 
-The selected stack is Django, PostgreSQL, Django Admin for operator review, and a separate process for background work. Prefer built-in Django capabilities and avoid additional infrastructure unless it materially improves a stated requirement. Record meaningful trade-offs in the project documentation.
+The selected stack is Django, PostgreSQL, Django Admin for operator review, Celery for background processing, and Redis as the task broker and shared rate-limiting backend. PostgreSQL remains the source of truth for tickets, drafts, moderation decisions, and delivery state.
+
+Consider Django's built-in capabilities and established libraries before implementing custom functionality. Prefer existing solutions when they meet project requirements and simplify implementation without introducing unnecessary dependencies or complexity. Avoid forcing existing abstractions when a custom solution is more appropriate. Discuss significant architectural trade-offs before implementation and document relevant operational limitations in `README.md`.
 
 ## Working agreement
 
