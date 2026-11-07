@@ -17,9 +17,10 @@ Including another URLconf
 from django.contrib import admin
 from django.urls import path
 
-from support.views import health
+from support.views import health, helpdesk_webhook
 
 urlpatterns = [
     path('health', health, name='health'),
+    path('webhooks/helpdesk', helpdesk_webhook, name='helpdesk_webhook'),
     path('admin/', admin.site.urls),
 ]

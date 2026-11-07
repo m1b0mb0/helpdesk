@@ -89,7 +89,18 @@ DATABASES = {
         'HOST': os.environ.get("POSTGRES_HOST", "localhost"),
         'PORT': os.environ.get("POSTGRES_PORT", "5432"),
         'CONN_HEALTH_CHECKS': True,
-        'OPTIONS': {"connect_timeout": 5},
+        'OPTIONS': {
+            # libpq rounds connection timeouts below two seconds up to two.
+            # Pool acquisition is bounded separately while connections open in
+            # background threads. Keep CONN_MAX_AGE at its default of zero.
+            "connect_timeout": 2,
+            "tcp_user_timeout": 1000,
+            "pool": {
+                "min_size": 1,
+                "max_size": 4,
+                "timeout": float(os.environ.get("POSTGRES_POOL_TIMEOUT", "0.3")),
+            },
+        },
     }
 }
 
@@ -142,6 +153,15 @@ STORAGES = {
 # https://docs.djangoproject.com/en/5.2/ref/settings/#default-auto-field
 
 DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
+
+HELPDESK_ALLOWED_ORIGINS = tuple(
+    origin.strip()
+    for origin in os.environ.get(
+        "HELPDESK_ALLOWED_ORIGINS",
+        "http://web:8000,https://helpdesk.example.com",
+    ).split(",")
+    if origin.strip()
+)
 
 
 # PostgreSQL will hold business results; Celery results are deliberately disabled.
