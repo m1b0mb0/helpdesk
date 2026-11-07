@@ -15,6 +15,13 @@ x-app: &app
     CELERY_BROKER_URL: redis://redis:6379/0
     CELERY_WORKER_CONCURRENCY: ${CELERY_WORKER_CONCURRENCY:-2}
     CELERY_BROKER_VISIBILITY_TIMEOUT: ${CELERY_BROKER_VISIBILITY_TIMEOUT:-300}
+    GENERATION_ENABLED: ${GENERATION_ENABLED:-false}
+    GENERATION_RECONCILE_INTERVAL: ${GENERATION_RECONCILE_INTERVAL:-5}
+    GENERATION_MAX_INFLIGHT: ${GENERATION_MAX_INFLIGHT:-${CELERY_WORKER_CONCURRENCY:-2}}
+    GENERATION_MAX_ATTEMPTS: ${GENERATION_MAX_ATTEMPTS:-3}
+    GENERATION_MAX_DISPATCHES: ${GENERATION_MAX_DISPATCHES:-10}
+    GENERATION_QUEUE_LEASE_SECONDS: ${GENERATION_QUEUE_LEASE_SECONDS:-60}
+    GENERATION_LEASE_SECONDS: ${GENERATION_LEASE_SECONDS:-120}
   restart: unless-stopped
 
 services:
@@ -62,7 +69,7 @@ services:
 
   worker:
     <<: *app
-    command: ["celery", "-A", "config", "worker", "--loglevel=INFO"]
+    command: ["celery", "-A", "config", "worker", "--loglevel=INFO", "--queues=celery,generation"]
     depends_on:
       db:
         condition: service_healthy
@@ -70,13 +77,22 @@ services:
         condition: service_healthy
       web:
         condition: service_healthy
-    stop_grace_period: 60s
+    stop_grace_period: 100s
     healthcheck:
       test: ["CMD-SHELL", "celery -A config inspect ping --destination celery@$$HOSTNAME --timeout 3"]
       interval: 20s
       timeout: 5s
       retries: 3
       start_period: 20s
+
+  beat:
+    <<: *app
+    command: ["celery", "-A", "config", "beat", "--loglevel=INFO"]
+    depends_on:
+      db:
+        condition: service_healthy
+      web:
+        condition: service_healthy
 
 volumes:
   postgres_data:
