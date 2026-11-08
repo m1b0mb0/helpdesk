@@ -4,7 +4,8 @@ x-app: &app
   environment:
     DJANGO_SECRET_KEY: ${DJANGO_SECRET_KEY:?Copy .env.example to .env and set DJANGO_SECRET_KEY}
     DJANGO_DEBUG: ${DJANGO_DEBUG:-false}
-    DJANGO_ALLOWED_HOSTS: ${DJANGO_ALLOWED_HOSTS:-localhost,127.0.0.1,[::1]}
+    # Workers call the local mock through the internal Compose hostname.
+    DJANGO_ALLOWED_HOSTS: ${DJANGO_ALLOWED_HOSTS:-localhost,127.0.0.1,[::1]},web
     POSTGRES_DB: ${POSTGRES_DB:-helpdesk}
     POSTGRES_USER: ${POSTGRES_USER:-helpdesk}
     POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
@@ -30,6 +31,16 @@ x-app: &app
     LLM_DEMO_DELAY_SECONDS: ${LLM_DEMO_DELAY_SECONDS:-5}
     LLM_REDIS_URL: redis://redis:6379/0
     LLM_RATE_LIMIT_KEY: ${LLM_RATE_LIMIT_KEY:-helpdesk:llm:global}
+    DELIVERY_ENABLED: ${DELIVERY_ENABLED:-true}
+    DELIVERY_HTTP_TIMEOUT: ${DELIVERY_HTTP_TIMEOUT:-5}
+    DELIVERY_MAX_INFLIGHT: ${DELIVERY_MAX_INFLIGHT:-${CELERY_WORKER_CONCURRENCY:-2}}
+    DELIVERY_MAX_ATTEMPTS: ${DELIVERY_MAX_ATTEMPTS:-3}
+    DELIVERY_MAX_DISPATCHES: ${DELIVERY_MAX_DISPATCHES:-10}
+    DELIVERY_QUEUE_LEASE_SECONDS: ${DELIVERY_QUEUE_LEASE_SECONDS:-60}
+    DELIVERY_LEASE_SECONDS: ${DELIVERY_LEASE_SECONDS:-120}
+    MOCK_HELPDESK_FAULTS_ENABLED: ${MOCK_HELPDESK_FAULTS_ENABLED:-false}
+    MOCK_HELPDESK_FAULTS: ${MOCK_HELPDESK_FAULTS:-}
+    MOCK_HELPDESK_FAULT_DELAY_SECONDS: ${MOCK_HELPDESK_FAULT_DELAY_SECONDS:-10}
   restart: unless-stopped
 
 services:
@@ -77,7 +88,7 @@ services:
 
   worker:
     <<: *app
-    command: ["celery", "-A", "config", "worker", "--loglevel=INFO", "--queues=celery,generation"]
+    command: ["celery", "-A", "config", "worker", "--loglevel=INFO", "--queues=celery,generation,delivery"]
     depends_on:
       db:
         condition: service_healthy

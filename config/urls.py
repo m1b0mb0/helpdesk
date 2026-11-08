@@ -18,11 +18,13 @@ from django.contrib import admin
 from django.urls import path
 
 from support.knowledge_views import knowledge_article, knowledge_index
+from support.mock_helpdesk import mock_reply
 from support.views import health, helpdesk_webhook
 
 urlpatterns = [
     path('health', health, name='health'),
     path('webhooks/helpdesk', helpdesk_webhook, name='helpdesk_webhook'),
+    path('tickets/<path:ticket_id>/replies', mock_reply, name='mock_reply'),
     path('knowledge/', knowledge_index, name='knowledge_index'),
     path('knowledge/<slug:slug>', knowledge_article, name='knowledge_article'),
     path('admin/', admin.site.urls),

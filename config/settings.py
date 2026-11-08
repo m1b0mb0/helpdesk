@@ -11,6 +11,7 @@ https://docs.djangoproject.com/en/5.2/ref/settings/
 """
 
 import os
+import json
 from pathlib import Path
 
 from django.core.exceptions import ImproperlyConfigured
@@ -214,3 +215,21 @@ LLM_DEMO_DELAY_SECONDS = float(os.environ.get("LLM_DEMO_DELAY_SECONDS", "5"))
 LLM_REDIS_URL = os.environ.get("LLM_REDIS_URL", CELERY_BROKER_URL)
 # All workers sharing a provider quota MUST use the same Redis and key.
 LLM_RATE_LIMIT_KEY = os.environ.get("LLM_RATE_LIMIT_KEY", "helpdesk:llm:global")
+
+# Mock failures are opt-in, keyed to individual test deliveries, never HTTP controls.
+MOCK_HELPDESK_FAULTS_ENABLED = os.environ.get("MOCK_HELPDESK_FAULTS_ENABLED", "false").lower() in {"1", "true", "yes"}
+try:
+    MOCK_HELPDESK_FAULTS = json.loads(os.environ.get("MOCK_HELPDESK_FAULTS", "") or "{}")
+except ValueError as error:
+    raise ImproperlyConfigured("MOCK_HELPDESK_FAULTS must be a JSON object.") from error
+MOCK_HELPDESK_FAULT_DELAY_SECONDS = float(os.environ.get("MOCK_HELPDESK_FAULT_DELAY_SECONDS", "10"))
+
+DELIVERY_ENABLED = os.environ.get("DELIVERY_ENABLED", "true").lower() in {"1", "true", "yes"}
+DELIVERY_HTTP_TIMEOUT = float(os.environ.get("DELIVERY_HTTP_TIMEOUT", "5"))
+DELIVERY_MAX_INFLIGHT = int(os.environ.get("DELIVERY_MAX_INFLIGHT", str(CELERY_WORKER_CONCURRENCY)))
+DELIVERY_MAX_ATTEMPTS = int(os.environ.get("DELIVERY_MAX_ATTEMPTS", "3"))
+DELIVERY_MAX_DISPATCHES = int(os.environ.get("DELIVERY_MAX_DISPATCHES", "10"))
+DELIVERY_QUEUE_LEASE_SECONDS = int(os.environ.get("DELIVERY_QUEUE_LEASE_SECONDS", "60"))
+DELIVERY_LEASE_SECONDS = int(os.environ.get("DELIVERY_LEASE_SECONDS", "120"))
+DELIVERY_RETRY_BASE_SECONDS = 5
+DELIVERY_RETRY_MAX_SECONDS = 60

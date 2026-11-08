@@ -10,6 +10,10 @@ class SupportRequest(models.Model):
         GENERATING = "generating", "Generating"
         REVIEW = "review", "Awaiting review"
         APPROVED = "approved", "Approved; awaiting delivery"
+        DELIVERY_QUEUED = "delivery_queued", "Delivery queued"
+        SENDING = "sending", "Sending"
+        SENT = "sent", "Sent"
+        DELIVERY_FAILED = "delivery_failed", "Delivery failed"
         REJECTED = "rejected", "Rejected"
         FAILED = "failed", "Failed"
 
@@ -29,6 +33,14 @@ class SupportRequest(models.Model):
     draft_sources = models.JSONField(default=list, blank=True)
     approved_text = models.TextField(blank=True)
     delivery_key = models.UUIDField(null=True, blank=True, unique=True)
+    delivery_attempt_count = models.PositiveIntegerField(default=0)
+    delivery_dispatch_count = models.PositiveIntegerField(default=0)
+    delivery_token = models.UUIDField(null=True, blank=True)
+    delivery_lease_expires_at = models.DateTimeField(null=True, blank=True)
+    delivery_next_attempt_at = models.DateTimeField(default=timezone.now)
+    delivery_last_attempt_at = models.DateTimeField(null=True, blank=True)
+    delivery_last_error = models.TextField(blank=True)
+    sent_at = models.DateTimeField(null=True, blank=True)
     moderated_at = models.DateTimeField(null=True, blank=True)
     moderated_by = models.ForeignKey(
         settings.AUTH_USER_MODEL, null=True, blank=True,
@@ -40,7 +52,10 @@ class SupportRequest(models.Model):
     updated_at = models.DateTimeField(auto_now=True)
 
     class Meta:
-        indexes = (models.Index(fields=["status", "next_attempt_at"]),)
+        indexes = (
+            models.Index(fields=["status", "next_attempt_at"]),
+            models.Index(fields=["status", "delivery_next_attempt_at"]),
+        )
         permissions = (("moderate_supportrequest", "Can moderate support request drafts"),)
         constraints = (
             models.CheckConstraint(
@@ -52,7 +67,9 @@ class SupportRequest(models.Model):
             ),
             models.CheckConstraint(
                 condition=(
-                    ~models.Q(status="approved")
+                    ~models.Q(status__in=[
+                        "approved", "delivery_queued", "sending", "sent", "delivery_failed",
+                    ])
                     | (~models.Q(approved_text="") & models.Q(
                         delivery_key__isnull=False, moderated_at__isnull=False,
                         moderated_by__isnull=False,
@@ -69,6 +86,13 @@ class SupportRequest(models.Model):
                     )
                 ),
                 name="support_rejected_has_no_delivery",
+            ),
+            models.CheckConstraint(
+                condition=(
+                    models.Q(status="sent", sent_at__isnull=False)
+                    | (~models.Q(status="sent") & models.Q(sent_at__isnull=True))
+                ),
+                name="support_sent_has_timestamp",
             ),
         )
 
@@ -88,3 +112,13 @@ class KnowledgeArticle(models.Model):
 
     def __str__(self):
         return self.title
+
+
+class MockReply(models.Model):
+    idempotency_key = models.CharField(max_length=128, unique=True)
+    ticket_id = models.CharField(max_length=255)
+    message = models.TextField()
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    def __str__(self):
+        return f"{self.ticket_id}: {self.idempotency_key}"
