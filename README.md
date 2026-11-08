@@ -8,17 +8,27 @@ Django backend for an AI-assisted support workflow. Incoming events are stored i
 - Internet access for the initial image build.
 - PostgreSQL 17 or newer for the webhook transaction timeout; Compose provides PostgreSQL 17.
 
-## Start locally
+## Demo quick start (no API key)
 
 From the repository root, using PowerShell:
 
 ```powershell
-Copy-Item .env.example .env
+if (-not (Test-Path -LiteralPath .env)) {
+    Copy-Item .env.example .env
+}
 ```
 
-Set `DJANGO_SECRET_KEY` and `POSTGRES_PASSWORD` in `.env` before starting. Keep this file local; it is ignored by Git. The example contains configuration placeholders, not production credentials.
+Set `DJANGO_SECRET_KEY` and `POSTGRES_PASSWORD` in `.env` to your own values before starting. Keep this file local; it is ignored by Git. The example contains configuration placeholders, not production credentials. For this demo, check these settings:
 
-If `.env` already exists, keep its current values instead of copying the example over it.
+```dotenv
+GENERATION_ENABLED=true
+LLM_API_KEY=
+PUBLIC_BASE_URL=http://localhost:8000
+```
+
+The copy command preserves an existing `.env`. Keep its credentials and other settings; change only the demo settings above deliberately. In particular, an existing `GENERATION_ENABLED=false` still pauses generation. If using another `WEB_PORT`, update `PUBLIC_BASE_URL` and the browser/webhook URLs to match; the internal `reply_url` remains `http://web:8000/...`.
+
+Start the services and leave this terminal running:
 
 ```powershell
 docker compose up --build
@@ -39,6 +49,59 @@ Create an administrator in another terminal:
 ```powershell
 docker compose exec web python manage.py createsuperuser
 ```
+
+In that same terminal, send this webhook:
+
+```powershell
+$demoUri = 'http://localhost:8000/webhooks/helpdesk'
+$demoBody = @'
+{
+  "event_id": "evt_demo_001",
+  "ticket_id": "T-DEMO-001",
+  "customer_email": "reader@example.com",
+  "message": "I cannot export a MetricNest report to PDF. Where is the export option, and what permissions do I need?",
+  "reply_url": "http://web:8000/tickets/T-DEMO-001/replies"
+}
+'@
+Invoke-RestMethod -Method Post -Uri $demoUri -ContentType 'application/json' -Body $demoBody
+```
+
+Expect HTTP `202` with status `accepted`; PostgreSQL now contains the event. **Allow about three minutes for the first draft on a fresh instance.** The first generation attempt starts a conservative 156-second limiter recovery pause, followed by polling and the 5–30-second generation attempt. This is background processing time, separate from the short webhook response. The pause applies once per Redis epoch or missing limiter state, not to every event. A later Redis restart or loss of limiter state starts another recovery pause.
+
+Even with an empty key, the worker makes a real HTTP POST to Groq without an Authorization header. Regardless of that HTTP result or a network error, it produces a clearly marked static demo draft with retrieved article links. This does not test successful authenticated generation.
+
+Log in at `http://localhost:8000/admin/`, open **Support requests**, and find `T-DEMO-001`. Wait for **Awaiting review** (`review`), open the request, and inspect the original message, draft and **Verified knowledge sources**. Return to the list, select it, choose **Approve selected drafts**, and click **Go**. Delivery proceeds automatically through `approved`, `delivery_queued` and `sending` to **Sent** (`sent`); refresh after a few seconds.
+
+Open **Mock replies** in Admin and search for `T-DEMO-001`: there should be exactly one stored reply matching the approved text. This read-only command also checks the status and the count for its delivery key:
+
+```powershell
+docker compose exec web python manage.py shell -c "from support.models import MockReply, SupportRequest; request = SupportRequest.objects.get(event_id='evt_demo_001'); print({'status': request.status, 'mock_replies': MockReply.objects.filter(idempotency_key=str(request.delivery_key)).count()})"
+```
+
+Expect `{'status': 'sent', 'mock_replies': 1}`. Resend the unchanged webhook to check deduplication:
+
+```powershell
+Invoke-RestMethod -Method Post -Uri $demoUri -ContentType 'application/json' -Body $demoBody
+```
+
+Expect HTTP `200` with status `duplicate`, with no new generation or delivery. The reply count stays one.
+
+To check rejection, create a separate event and ticket:
+
+```powershell
+$rejectedDemoBody = @'
+{
+  "event_id": "evt_demo_reject_001",
+  "ticket_id": "T-DEMO-REJECT-001",
+  "customer_email": "reader@example.com",
+  "message": "How do I export a MetricNest report to PDF?",
+  "reply_url": "http://web:8000/tickets/T-DEMO-REJECT-001/replies"
+}
+'@
+Invoke-RestMethod -Method Post -Uri $demoUri -ContentType 'application/json' -Body $rejectedDemoBody
+```
+
+Wait for `review`, inspect the draft, then choose **Reject selected drafts** and click **Go**. The request becomes **Rejected** (`rejected`) and no delivery is created. Search **Mock replies** for `T-DEMO-REJECT-001` to confirm there is no reply. Use new event and ticket IDs when repeating these independent demos; an unchanged event ID intentionally returns the existing result.
 
 The web port defaults to `8000` and can be changed with `WEB_PORT`. It is published on `127.0.0.1` only. PostgreSQL and Redis are accessible inside the Compose network and do not publish host ports.
 
@@ -67,13 +130,13 @@ PostgreSQL and Redis have Compose health checks. The container configuration use
 | `WEB_PORT` | Host port for the web service; defaults to `8000`. |
 | `CELERY_WORKER_CONCURRENCY` | Worker process count; defaults to `2`. |
 | `CELERY_BROKER_VISIBILITY_TIMEOUT` | Redis message visibility timeout in seconds; defaults to `300`. |
-| `GENERATION_ENABLED` | Defaults to `false`. Set `true` explicitly to enable automatic draft generation. |
+| `GENERATION_ENABLED` | Defaults to `true` for the demo. Set `false` to pause automatic draft generation while retaining accepted events. |
 | `GENERATION_RECONCILE_INTERVAL` | Reconciliation interval in seconds; defaults to `5`. |
 | `GENERATION_MAX_INFLIGHT` | Global number of queued/running requests; defaults to worker concurrency. Set it to the intended total capacity if using multiple worker containers. |
 | `GENERATION_MAX_ATTEMPTS`, `GENERATION_MAX_DISPATCHES` | Maximum execution attempts (`3`) and queue reservations (`10`) per request. |
 | `GENERATION_QUEUE_LEASE_SECONDS`, `GENERATION_LEASE_SECONDS` | Queue reservation (`60`) and running execution (`120`) leases. |
 | `PUBLIC_BASE_URL` | Public HTTP(S) origin for article links; defaults to `http://localhost:8000`. Match the host and port readers actually use. |
-| `LLM_PROVIDER`, `LLM_MODEL` | Only `groq` is implemented; default model is `llama-3.3-70b-versatile`. Model access depends on your Groq account. |
+| `LLM_PROVIDER`, `LLM_MODEL` | Only `groq` is implemented; default model is `openai/gpt-oss-120b`. Model access depends on your Groq account. |
 | `LLM_API_KEY` | Groq API key. Empty selects the explicit no-key demo mode; an invalid nonempty key never does. |
 | `LLM_HTTP_TIMEOUT` | Total HTTP deadline, including DNS and response reading; default `15s`, maximum `20s`. |
 | `LLM_DEMO_DELAY_SECONDS` | Minimum total duration of a no-key attempt; default `5s`, permitted range `5..25s`. |
@@ -156,7 +219,7 @@ These controls provide a practical short failure path, not a universal guarantee
 
 ## Background processing
 
-Generation is opt-in: keep `GENERATION_ENABLED=false` while configuring the provider and public article origin, then enable it as shown below. Pending requests remain safely stored while generation is paused.
+Generation is enabled by default for the demo. Set `GENERATION_ENABLED=false` to pause it while configuring the provider or public article origin. Pending requests remain safely stored while generation is paused, and delivery remains independently enabled.
 
 When enabled, the processing states are `pending → queued → generating → review`. Temporary failures return to `pending` with a persisted retry time; exhausted budgets and permanent errors become `failed`.
 
@@ -225,15 +288,17 @@ Without a key, the same real Groq HTTP POST is attempted with no Authorization h
 
 The atomic Redis limiter allows at most 60 outstanding/recent HTTP attempts globally. It retains each permit until HTTP completes plus 61 seconds, including errors and no-key requests. Unfinished permits expire after the hard task limit plus 61 seconds and a five-second margin: currently 156 seconds. This conservative scheme also covers a worker paused between acquiring permission and starting HTTP, at the cost of throughput below 60/minute for long calls.
 
-**Cold start, Redis restart, or missing limiter state imposes a 156-second recovery pause.** The Lua script checks Redis `run_id` atomically and waits out old running tasks plus a full window before issuing new permits; this covers lost recent AOF writes. Redis failure blocks HTTP. Correctness assumes all workers share one Redis/key, stable Redis server time, and an enforced 90-second prefork hard limit. Do not delete/modify limiter keys or bypass the generator when testing quota behavior. A custom Redis ACL must permit the Lua script's INFO, TIME, hash and sorted-set operations.
+**Cold start, Redis restart, or missing limiter state imposes a 156-second recovery pause.** It starts at the next acquisition attempt and applies once per Redis epoch or missing state, not once per event. The Lua script checks Redis `run_id` atomically and waits out old running tasks plus a full window before issuing new permits; this covers lost recent AOF writes. Redis failure blocks HTTP. Correctness assumes all workers share one Redis/key, stable Redis server time, and an enforced 90-second prefork hard limit. Do not delete/modify limiter keys or bypass the generator when testing quota behavior. A custom Redis ACL must permit the Lua script's INFO, TIME, hash and sorted-set operations.
 
-To enable generation, set `GENERATION_ENABLED=true` in your local `.env`, set `PUBLIC_BASE_URL`, and optionally supply `LLM_API_KEY`, then recreate the services:
+### Use a real Groq API key
+
+To use authenticated generation, set `LLM_API_KEY` in your local `.env`, keep `GENERATION_ENABLED=true`, and use `LLM_MODEL=openai/gpt-oss-120b`. Set `PUBLIC_BASE_URL` to the origin where readers can open the article links, then recreate the services:
 
 ```powershell
 docker compose up -d --build
 ```
 
-Send a webhook about PDF export, wait for the initial limiter pause if needed, and inspect `review`, `draft_text` and `draft_sources` in Django Admin. With an empty key the draft is clearly marked as a demonstration. A configured key uses the real provider response and is subject to the account's own quotas, which can be lower than the service limit. See the [Groq API reference](https://console.groq.com/docs/api-reference).
+Send a webhook with a new event ID about PDF export, wait for the initial limiter pause if needed, and inspect `review`, `draft_text` and `draft_sources` in Django Admin. A configured key uses the provider response and never falls back to the static demo if rejected. Model access and provider quotas depend on the account and can be lower than the service limit. Automated provider tests use controlled responses; the no-key demo does not establish authenticated success. See the [Groq API reference](https://console.groq.com/docs/api-reference).
 
 The custom Beat scheduler overrides `tick()` and explicitly runs generation and delivery reconciliation, each in its own error boundary. It does **not** execute the standard `beat_schedule`. Both poll using `GENERATION_RECONCILE_INTERVAL` (default five seconds), including delivery when generation is disabled.
 
@@ -331,6 +396,6 @@ Celery uses late acknowledgements and rejects tasks when a worker process is los
 
 Webhook acceptance and deduplication are stored in PostgreSQL, independently of Redis availability. Redis message expiration prevents late execution but does not physically remove expired list entries until a worker reads them. The global in-flight limit and bounded dispatch reservations limit business-message duplication; obsolete messages are ignored using PostgreSQL tokens when consumed. Prolonged failures can exhaust a request's budget and require the explicit operator retry described above.
 
-Knowledge retrieval, draft generation, moderation and idempotent mock delivery are implemented. Generation remains disabled by default until explicitly enabled; delivery is independently enabled. One accepted delivery result is fenced locally, and one stored customer reply is guaranteed by the mock's idempotency contract. A different receiver must support the same persistent key semantics: a sender alone cannot rule out duplicate effects after an ambiguous timeout.
+Knowledge retrieval, draft generation, moderation and idempotent mock delivery are implemented. Generation and delivery are enabled by default and can be paused independently. One accepted delivery result is fenced locally, and one stored customer reply is guaranteed by the mock's idempotency contract. A different receiver must support the same persistent key semantics: a sender alone cannot rule out duplicate effects after an ambiguous timeout.
 
 This configuration is for a local demonstration. Public hosting requires deployment-specific configuration, including TLS and appropriate access controls.
