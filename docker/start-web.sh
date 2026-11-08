@@ -2,6 +2,7 @@
 set -eu
 
 python manage.py migrate --noinput
+python manage.py seed_knowledge
 python manage.py collectstatic --noinput
 
 exec gunicorn config.wsgi:application \

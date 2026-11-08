@@ -1,0 +1,9 @@
+<!doctype html>
+<html lang="uk">
+<head><meta charset="utf-8"><title>{{ article.title }} — MetricNest</title></head>
+<body>
+  <nav><a href="{% url 'knowledge_index' %}">Knowledge base</a></nav>
+  <h1>{{ article.title }}</h1>
+  {{ article.body|linebreaks }}
+</body>
+</html>

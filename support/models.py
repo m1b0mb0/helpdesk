@@ -34,3 +34,17 @@ class SupportRequest(models.Model):
 
     def __str__(self):
         return self.event_id
+
+
+class KnowledgeArticle(models.Model):
+    slug = models.SlugField(max_length=100, unique=True)
+    title = models.CharField(max_length=200)
+    body = models.TextField()
+    keywords = models.JSONField(default=list)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ("slug",)
+
+    def __str__(self):
+        return self.title
