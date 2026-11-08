@@ -191,8 +191,8 @@ CELERY_RESULT_BACKEND_TRANSPORT_OPTIONS = {
     "visibility_timeout": CELERY_VISIBILITY_TIMEOUT,
 }
 
-# Enable explicitly after checking provider and public article URLs.
-GENERATION_ENABLED = os.environ.get("GENERATION_ENABLED", "false").lower() in {"1", "true", "yes"}
+# Enabled for the demo; an explicit false pauses generation without losing events.
+GENERATION_ENABLED = os.environ.get("GENERATION_ENABLED", "true").lower() in {"1", "true", "yes"}
 GENERATION_RECONCILE_INTERVAL = int(os.environ.get("GENERATION_RECONCILE_INTERVAL", "5"))
 GENERATION_MAX_INFLIGHT = int(os.environ.get("GENERATION_MAX_INFLIGHT", str(CELERY_WORKER_CONCURRENCY)))
 GENERATION_MAX_ATTEMPTS = int(os.environ.get("GENERATION_MAX_ATTEMPTS", "3"))
@@ -208,7 +208,7 @@ CELERY_BEAT_SCHEDULER = "support.scheduling.DatabaseReconciliationScheduler"
 
 PUBLIC_BASE_URL = os.environ.get("PUBLIC_BASE_URL", "http://localhost:8000").rstrip("/")
 LLM_PROVIDER = os.environ.get("LLM_PROVIDER", "groq").lower()
-LLM_MODEL = os.environ.get("LLM_MODEL", "llama-3.3-70b-versatile")
+LLM_MODEL = os.environ.get("LLM_MODEL", "openai/gpt-oss-120b")
 LLM_API_KEY = os.environ.get("LLM_API_KEY", "").strip()
 LLM_HTTP_TIMEOUT = float(os.environ.get("LLM_HTTP_TIMEOUT", "15"))
 LLM_DEMO_DELAY_SECONDS = float(os.environ.get("LLM_DEMO_DELAY_SECONDS", "5"))

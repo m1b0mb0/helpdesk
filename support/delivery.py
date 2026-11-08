@@ -23,10 +23,6 @@ class PermanentDeliveryError(Exception):
     pass
 
 
-class InvalidDeliveryState(ValueError):
-    pass
-
-
 def _backoff(count):
     return min(
         settings.DELIVERY_RETRY_BASE_SECONDS * 2 ** min(max(count - 1, 0), 16),
