@@ -1,3 +1,4 @@
+from django.conf import settings
 from django.db import models
 from django.utils import timezone
 
@@ -8,6 +9,8 @@ class SupportRequest(models.Model):
         QUEUED = "queued", "Queued"
         GENERATING = "generating", "Generating"
         REVIEW = "review", "Awaiting review"
+        APPROVED = "approved", "Approved; awaiting delivery"
+        REJECTED = "rejected", "Rejected"
         FAILED = "failed", "Failed"
 
     event_id = models.CharField(max_length=255, unique=True)
@@ -24,6 +27,13 @@ class SupportRequest(models.Model):
     lease_expires_at = models.DateTimeField(null=True, blank=True)
     draft_text = models.TextField(blank=True)
     draft_sources = models.JSONField(default=list, blank=True)
+    approved_text = models.TextField(blank=True)
+    delivery_key = models.UUIDField(null=True, blank=True, unique=True)
+    moderated_at = models.DateTimeField(null=True, blank=True)
+    moderated_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, null=True, blank=True,
+        on_delete=models.PROTECT, related_name="+",
+    )
     next_attempt_at = models.DateTimeField(default=timezone.now)
     last_error = models.TextField(blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
@@ -31,6 +41,36 @@ class SupportRequest(models.Model):
 
     class Meta:
         indexes = (models.Index(fields=["status", "next_attempt_at"]),)
+        permissions = (("moderate_supportrequest", "Can moderate support request drafts"),)
+        constraints = (
+            models.CheckConstraint(
+                condition=(
+                    models.Q(approved_text="", delivery_key__isnull=True)
+                    | (~models.Q(approved_text="") & models.Q(delivery_key__isnull=False))
+                ),
+                name="support_delivery_snapshot_pair",
+            ),
+            models.CheckConstraint(
+                condition=(
+                    ~models.Q(status="approved")
+                    | (~models.Q(approved_text="") & models.Q(
+                        delivery_key__isnull=False, moderated_at__isnull=False,
+                        moderated_by__isnull=False,
+                    ))
+                ),
+                name="support_approved_has_decision",
+            ),
+            models.CheckConstraint(
+                condition=(
+                    ~models.Q(status="rejected")
+                    | models.Q(
+                        approved_text="", delivery_key__isnull=True,
+                        moderated_at__isnull=False, moderated_by__isnull=False,
+                    )
+                ),
+                name="support_rejected_has_no_delivery",
+            ),
+        )
 
     def __str__(self):
         return self.event_id

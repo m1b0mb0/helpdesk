@@ -1,6 +1,6 @@
 # Helpdesk
 
-Django backend for an AI-assisted support workflow. Incoming events are stored idempotently in PostgreSQL. Celery generates drafts using a bilingual knowledge base and Groq HTTP API, with a shared Redis rate limiter and crash recovery. Moderation and reply delivery are not implemented yet.
+Django backend for an AI-assisted support workflow. Incoming events are stored idempotently in PostgreSQL. Celery generates drafts using a bilingual knowledge base and Groq HTTP API, with a shared Redis rate limiter and crash recovery. Operators approve or reject drafts in Django Admin. Reply delivery is not implemented yet.
 
 ## Requirements
 
@@ -169,6 +169,33 @@ docker compose exec web python manage.py shell -c "from support.processing impor
 
 This returns the request to `pending`; generation must also be enabled. Resetting budgets is a deliberate operator action.
 
+## Operator moderation
+
+Use `/admin/support/supportrequest/` to search by event ID, ticket ID or email and filter by status. The list shows the customer email and creation/update dates. Open a ticket to read the original message, draft, verified knowledge links and generation error. Technical fields are read-only, including for users with the ordinary change permission.
+
+A superuser can moderate directly. For a restricted operator, create an active staff user in Django Admin and assign these two permissions, directly or through a group:
+
+- `support | support request | Can view support request`
+- `support | support request | Can moderate support request drafts`
+
+The ordinary change permission does not grant moderation. Viewing without the custom moderation permission remains read-only. Admin login and CSRF protection apply to both actions.
+
+To moderate a draft:
+
+1. Filter the list to **Awaiting review** and open the ticket to inspect its draft and sources.
+2. Return to the list, select the ticket, choose **Approve selected drafts** or **Reject selected drafts**, then click **Go**.
+3. Check the action summary and resulting status. Bulk selections validate each row independently; non-review or invalid drafts are skipped instead of bypassing checks.
+
+Approval uses a short PostgreSQL transaction and row lock, revalidates the draft and its sources, and saves an exact `approved_text` snapshot, one unique `delivery_key`, the operator and decision timestamp. Repeated or competing decisions cannot replace these values. Reject records the operator/time and creates no delivery intent; even a malformed draft can be safely rejected. The database rejects incomplete approval records and rejected records with delivery intent.
+
+`approved` means **awaiting delivery**, not sent. No HTTP or Celery publication occurs during moderation; C2 will send the frozen `approved_text` and reuse the same `delivery_key` for retries. The generation reconciler ignores both `approved` and `rejected`. Decisions cannot be undone in this interface, and draft editing is not supported. A later source edit can invalidate an existing draft; approval then fails safely. Referenced moderator accounts are protected from deletion to preserve the audit record; deactivate them instead.
+
+Focused tests, including races on independent PostgreSQL connections:
+
+```powershell
+docker compose exec web python manage.py test support.tests.test_admin support.tests.test_moderation
+```
+
 ## Knowledge base and LLM generation
 
 The eight AI-authored MetricNest articles cover PDF/CSV export, data refresh, scheduled emails, permissions, date/time zones, billing, and account access. They contain Ukrainian and English text. Search ranks explicit bilingual topic aliases/prefixes and returns at most three articles; it intentionally does not match generic words such as "report". This is a small lexical corpus, not semantic search. No relevant article results in a visible `failed` request requiring investigation, with no invented answer or source.
@@ -258,6 +285,6 @@ Celery uses late acknowledgements and rejects tasks when a worker process is los
 
 Webhook acceptance and deduplication are stored in PostgreSQL, independently of Redis availability. Redis message expiration prevents late execution but does not physically remove expired list entries until a worker reads them. The global in-flight limit and bounded dispatch reservations limit business-message duplication; obsolete messages are ignored using PostgreSQL tokens when consumed. Prolonged failures can exhaust a request's budget and require the explicit operator retry described above.
 
-Knowledge retrieval and draft generation are implemented, but generation remains disabled by default until explicitly enabled. Moderation, mock helpdesk delivery, and outgoing reply idempotency remain later work.
+Knowledge retrieval, draft generation and operator moderation are implemented, but generation remains disabled by default until explicitly enabled. Mock helpdesk delivery and outgoing reply idempotency remain later work.
 
 This configuration is for a local demonstration. Public hosting requires deployment-specific configuration, including TLS and appropriate access controls.
