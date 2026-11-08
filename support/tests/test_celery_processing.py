@@ -23,7 +23,8 @@ from redis import Redis
 
 from config.celery import app as application_app
 from support.generation import Draft
-from support.models import SupportRequest
+from support.knowledge import article_source
+from support.models import KnowledgeArticle, SupportRequest
 from support.processing import reserve_generation, run_generation
 
 
@@ -53,6 +54,12 @@ class CeleryProcessingIntegrationTests(TransactionTestCase):
             customer_email="fixture@example.com",
             message="Controlled generator integration test",
             reply_url="http://web:8000/tickets/T-celery-test/replies",
+        )
+        self.article = KnowledgeArticle.objects.create(
+            slug="fixture-pdf-export",
+            title="Export a PDF report",
+            body="Open the report, select Export, and choose PDF.",
+            keywords=["pdf", "export", "експорт"],
         )
 
     def tearDown(self):
@@ -121,7 +128,7 @@ class CeleryProcessingIntegrationTests(TransactionTestCase):
                         time.sleep(30)
                     return Draft(
                         text="Controlled test draft for " + incoming.event_id,
-                        sources=[{"title": "Fixture source", "url": "https://example.com/fixture"}],
+                        sources=[article_source(self.article)],
                     )
 
                 result = run_generation(request_id, token, generator=controlled_generator)

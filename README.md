@@ -1,6 +1,6 @@
 # Helpdesk
 
-Django backend for an AI-assisted support workflow. Incoming helpdesk events are validated and stored idempotently in PostgreSQL. Reliable background scheduling and execution are implemented, but real generation is deliberately paused at checkpoint A. The knowledge base, LLM integration, moderation, and reply delivery are not implemented yet.
+Django backend for an AI-assisted support workflow. Incoming events are stored idempotently in PostgreSQL. Celery generates drafts using a bilingual knowledge base and Groq HTTP API, with a shared Redis rate limiter and crash recovery. Moderation and reply delivery are not implemented yet.
 
 ## Requirements
 
@@ -24,11 +24,12 @@ If `.env` already exists, keep its current values instead of copying the example
 docker compose up --build
 ```
 
-The web container waits for PostgreSQL, runs migrations, collects static files, and starts Gunicorn. The worker waits for healthy PostgreSQL, Redis, and web services, so database migrations have finished before it starts consuming tasks. Beat starts after PostgreSQL and web are ready.
+The web container waits for PostgreSQL, runs migrations, seeds eight knowledge articles, collects static files, and starts Gunicorn. The worker waits for healthy PostgreSQL, Redis, and web services, so database migrations have finished before it starts consuming tasks. Beat starts after PostgreSQL and web are ready.
 
 - Health check: `http://localhost:8000/health` returns HTTP `200` with body `OK`.
 - Django Admin: `http://localhost:8000/admin/`.
 - Incoming events: `POST http://localhost:8000/webhooks/helpdesk`.
+- Read-only knowledge base: `http://localhost:8000/knowledge/`.
 
 `/health` checks that the web process can respond. It does not check PostgreSQL or Redis availability after startup. Compose checks those services separately; the worker health check uses Celery ping.
 
@@ -65,11 +66,17 @@ PostgreSQL and Redis have Compose health checks. The container configuration use
 | `WEB_PORT` | Host port for the web service; defaults to `8000`. |
 | `CELERY_WORKER_CONCURRENCY` | Worker process count; defaults to `2`. |
 | `CELERY_BROKER_VISIBILITY_TIMEOUT` | Redis message visibility timeout in seconds; defaults to `300`. |
-| `GENERATION_ENABLED` | Defaults to `false` at checkpoint A. Keep generation paused until the real generator is implemented in checkpoint B. |
+| `GENERATION_ENABLED` | Defaults to `false`. Set `true` explicitly to enable automatic draft generation. |
 | `GENERATION_RECONCILE_INTERVAL` | Reconciliation interval in seconds; defaults to `5`. |
 | `GENERATION_MAX_INFLIGHT` | Global number of queued/running requests; defaults to worker concurrency. Set it to the intended total capacity if using multiple worker containers. |
 | `GENERATION_MAX_ATTEMPTS`, `GENERATION_MAX_DISPATCHES` | Maximum execution attempts (`3`) and queue reservations (`10`) per request. |
 | `GENERATION_QUEUE_LEASE_SECONDS`, `GENERATION_LEASE_SECONDS` | Queue reservation (`60`) and running execution (`120`) leases. |
+| `PUBLIC_BASE_URL` | Public HTTP(S) origin for article links; defaults to `http://localhost:8000`. Match the host and port readers actually use. |
+| `LLM_PROVIDER`, `LLM_MODEL` | Only `groq` is implemented; default model is `llama-3.3-70b-versatile`. Model access depends on your Groq account. |
+| `LLM_API_KEY` | Groq API key. Empty selects the explicit no-key demo mode; an invalid nonempty key never does. |
+| `LLM_HTTP_TIMEOUT` | Total HTTP deadline, including DNS and response reading; default `15s`, maximum `20s`. |
+| `LLM_DEMO_DELAY_SECONDS` | Minimum total duration of a no-key attempt; default `5s`, permitted range `5..25s`. |
+| `LLM_RATE_LIMIT_KEY` | Shared limiter namespace, default `helpdesk:llm:global`. Every worker sharing a quota must use the same key and Redis. |
 
 The visibility timeout must exceed the maximum task execution time and any scheduled countdown or ETA delay. Revisit it before adding long-running or delayed tasks.
 
@@ -138,9 +145,9 @@ The intake transaction sets local lock, statement, and transaction timeouts of 3
 
 These controls provide a practical short failure path, not a universal guarantee that every HTTP response takes less than two seconds. HTTP queueing, network faults, DNS, and OS scheduling can add delay. If a commit outcome is uncertain or a response is lost, retrying the same `event_id` remains safe. Timing and load measurements must state their actual environment and concurrency.
 
-## Background processing: checkpoint A
+## Background processing
 
-Keep `GENERATION_ENABLED=false` until checkpoint B. The production generator currently raises an explicit configuration error instead of creating a fake draft. Tests inject a controlled generator to exercise the complete execution and result-persistence path.
+Generation is opt-in: keep `GENERATION_ENABLED=false` while configuring the provider and public article origin, then enable it as shown below. Pending requests remain safely stored while generation is paused.
 
 When enabled, the processing states are `pending → queued → generating → review`. Temporary failures return to `pending` with a persisted retry time; exhausted budgets and permanent errors become `failed`.
 
@@ -150,7 +157,7 @@ The global in-flight limit keeps the backlog in PostgreSQL instead of publishing
 
 An execution increments its attempt count when claimed. No database transaction is held while the generator runs. Completion requires the current execution token and an unexpired lease; duplicate deliveries and results from stale workers cannot overwrite another execution. A crashed worker is recovered after its lease expires. A provider may still receive a repeated external call after a crash; this mechanism guarantees one accepted result, not exactly-once HTTP execution.
 
-Retries use PostgreSQL `next_attempt_at`, with exponential backoff from 5 seconds up to 60 seconds. There are no competing Celery retries or long broker-held countdowns. Defaults allow three execution attempts and ten dispatch reservations; exhausting either budget leaves a visible error rather than an infinite requeue loop.
+Retries use PostgreSQL `next_attempt_at`, with exponential backoff from 5 seconds up to 60 seconds, extended by a provider's numeric `Retry-After` (up to one hour). There are no competing Celery retries or long broker-held countdowns. Defaults allow three execution attempts and ten dispatch reservations; exhausting either budget leaves a visible error. A limiter denial or outage occurs before HTTP: it defers the request without spending those budgets, with a persisted wait of at least five seconds (60 seconds on Redis failure). Such waiting can continue through an outage; the backlog remains in PostgreSQL and the in-flight publication cap still applies.
 
 Celery uses late acknowledgements, worker-loss rejection, prefetch `1`, and cancellation on broker connection loss. The soft limit is 60 seconds, hard limit 90 seconds, execution lease 120 seconds, and Redis visibility timeout 300 seconds. Django system checks reject inconsistent timeout/acknowledgment settings. The worker has a 100-second graceful shutdown period.
 
@@ -160,7 +167,39 @@ Inspect requests, counters, leases, and errors in the read-only Support Requests
 docker compose exec web python manage.py shell -c "from support.processing import retry_failed_generation; print(retry_failed_generation(123))"
 ```
 
-This returns the request to `pending`; it does not enable the absent generator. Resetting budgets is a deliberate operator action, not an automatic retry loop.
+This returns the request to `pending`; generation must also be enabled. Resetting budgets is a deliberate operator action.
+
+## Knowledge base and LLM generation
+
+The eight AI-authored MetricNest articles cover PDF/CSV export, data refresh, scheduled emails, permissions, date/time zones, billing, and account access. They contain Ukrainian and English text. Search ranks explicit bilingual topic aliases/prefixes and returns at most three articles; it intentionally does not match generic words such as "report". This is a small lexical corpus, not semantic search. No relevant article results in a visible `failed` request requiring investigation, with no invented answer or source.
+
+Seeding runs on web startup and can be repeated manually:
+
+```powershell
+docker compose exec web python manage.py seed_knowledge
+```
+
+Stable unique slugs preserve article IDs and URLs across runs. Seeding restores the canonical eight articles, including edited text; additional slugs are preserved. `/knowledge/` and `/knowledge/<slug>` allow GET/HEAD only and escape stored HTML.
+
+Groq receives the message and retrieved article text in a JSON user-data envelope, separate from system instructions. It returns a plain answer and retrieved article IDs. The application rejects model-provided hyperlinks, markup, unknown IDs and incomplete/invalid responses, then attaches canonical URLs from PostgreSQL. `finish_generation()` checks sources again before the existing fenced update. These checks mitigate obvious prompt injection and forged links; they do not prove every generated claim is correct. Operator review remains necessary.
+
+The integration uses Python's HTTP client facilities, without an SDK or new dependency. Each task makes at most one HTTP attempt: no automatic retries, redirects, tools or proxy discovery. 429/temporary HTTP errors, network failures and invalid responses are retryable; other HTTP rejections, including 401, are permanent. Provider response bodies and credentials are not stored in errors. Retries use the existing PostgreSQL workflow.
+
+Without a key, the same real Groq HTTP POST is attempted with no Authorization header. Its HTTP outcome or network error is recorded in an informational log and ignored in favor of an explicitly marked static demo draft with only retrieved article URLs. The minimum total duration includes the HTTP attempt: a fast 401 waits out five seconds; a 15-second timeout does not add five more. A POSIX alarm bounds the entire HTTP operation, including DNS and slowly streamed responses. This requires the supplied Linux prefork deployment; unsupported execution modes fail explicitly instead of creating a demo without HTTP. HTTP deadline plus configured demo delay stays below 30 seconds under normal scheduling; the 60/90/120-second task/lease limits remain unchanged.
+
+The atomic Redis limiter allows at most 60 outstanding/recent HTTP attempts globally. It retains each permit until HTTP completes plus 61 seconds, including errors and no-key requests. Unfinished permits expire after the hard task limit plus 61 seconds and a five-second margin: currently 156 seconds. This conservative scheme also covers a worker paused between acquiring permission and starting HTTP, at the cost of throughput below 60/minute for long calls.
+
+**Cold start, Redis restart, or missing limiter state imposes a 156-second recovery pause.** The Lua script checks Redis `run_id` atomically and waits out old running tasks plus a full window before issuing new permits; this covers lost recent AOF writes. Redis failure blocks HTTP. Correctness assumes all workers share one Redis/key, stable Redis server time, and an enforced 90-second prefork hard limit. Do not delete/modify limiter keys or bypass the generator when testing quota behavior. A custom Redis ACL must permit the Lua script's INFO, TIME, hash and sorted-set operations.
+
+To enable generation, set `GENERATION_ENABLED=true` in your local `.env`, set `PUBLIC_BASE_URL`, and optionally supply `LLM_API_KEY`, then recreate the services:
+
+```powershell
+docker compose up -d --build
+```
+
+Send a webhook about PDF export, wait for the initial limiter pause if needed, and inspect `review`, `draft_text` and `draft_sources` in Django Admin. With an empty key the draft is clearly marked as a demonstration. A configured key uses the real provider response and is subject to the account's own quotas, which can be lower than the service limit. See the [Groq API reference](https://console.groq.com/docs/api-reference).
+
+The custom Beat scheduler overrides `tick()` and currently runs only generation reconciliation. It does **not** execute the standard `beat_schedule`; future delivery reconciliation must be explicitly integrated into this scheduler or the scheduler changed with equivalent backlog protections.
 
 ## Verify the setup
 
@@ -176,10 +215,10 @@ Webhook tests use PostgreSQL; concurrent cases use independent database connecti
 Run the focused background-processing tests with PostgreSQL and Redis available:
 
 ```powershell
-docker compose exec web python manage.py test support.test_processing support.test_celery_processing
+docker compose exec web python manage.py test support.tests.test_processing support.tests.test_celery_processing
 ```
 
-These tests use controlled generators, not the production placeholder. Do not enable a test generator for real accepted requests. The prefork crash test deliberately logs `WorkerLostError`; use the final test result to determine whether recovery passed.
+All automated tests live in `support/tests/`. Provider tests use controlled HTTP responses; limiter tests use real Redis and eight independent processes with a local HTTP server. These do not prove successful authenticated Groq generation. The prefork crash test deliberately logs `WorkerLostError`; use the final test result to determine whether recovery passed. Do not enable a test generator for real accepted requests.
 
 Celery task completion describes the handler, not the business outcome. Inspect PostgreSQL/Admin status and `last_error` to distinguish `review`, deferred retries, and terminal failures.
 
@@ -219,6 +258,6 @@ Celery uses late acknowledgements and rejects tasks when a worker process is los
 
 Webhook acceptance and deduplication are stored in PostgreSQL, independently of Redis availability. Redis message expiration prevents late execution but does not physically remove expired list entries until a worker reads them. The global in-flight limit and bounded dispatch reservations limit business-message duplication; obsolete messages are ignored using PostgreSQL tokens when consumed. Prolonged failures can exhaust a request's budget and require the explicit operator retry described above.
 
-Checkpoint A intentionally leaves real generation disabled. Checkpoint B must implement the knowledge base, HTTP generator, source validation, no-key behavior, and global LLM rate limiting. Moderation and outgoing reply idempotency remain later work. Existing drafts in processing tests are controlled fixtures only.
+Knowledge retrieval and draft generation are implemented, but generation remains disabled by default until explicitly enabled. Moderation, mock helpdesk delivery, and outgoing reply idempotency remain later work.
 
 This configuration is for a local demonstration. Public hosting requires deployment-specific configuration, including TLS and appropriate access controls.

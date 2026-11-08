@@ -15,8 +15,14 @@ from django.urls import reverse
 from django.utils import timezone
 from kombu.exceptions import OperationalError as BrokerError
 
-from support.generation import Draft, PermanentGenerationError, TransientGenerationError
-from support.models import SupportRequest
+from support.generation import (
+    DeferredGenerationError,
+    Draft,
+    PermanentGenerationError,
+    TransientGenerationError,
+)
+from support.knowledge import article_source
+from support.models import KnowledgeArticle, SupportRequest
 from support.processing import (
     claim_generation,
     fail_generation,
@@ -50,9 +56,15 @@ class GenerationProcessingTests(TransactionTestCase):
             "message": "How do I export a PDF report?",
             "reply_url": "https://helpdesk.example.com/tickets/T-generation/replies",
         }
+        self.article = KnowledgeArticle.objects.create(
+            slug="controlled-pdf-export",
+            title="Export a PDF report",
+            body="Open the report, select Export, and choose PDF.",
+            keywords=["pdf", "export", "експорт"],
+        )
         self.draft = Draft(
             text="Controlled generator output for this test only.",
-            sources=[{"title": "Controlled source", "url": "https://example.com/test-source"}],
+            sources=[article_source(self.article)],
         )
 
     def create_request(self, **changes):
@@ -228,6 +240,90 @@ class GenerationProcessingTests(TransactionTestCase):
         self.assertEqual(calls, [incoming.pk])
         incoming.refresh_from_db()
         self.assertEqual(incoming.attempt_count, 1)
+
+    def test_forged_source_is_rejected_before_saving_a_draft(self):
+        incoming = self.create_request()
+        dispatch_token = self.reserve_one(incoming)
+        claimed = claim_generation(incoming.pk, dispatch_token)
+        forged_source = {**article_source(self.article), "url": "https://evil.example/source"}
+
+        with self.assertRaises(PermanentGenerationError):
+            finish_generation(
+                incoming.pk,
+                claimed.processing_token,
+                Draft(text="A draft with a forged source.", sources=[forged_source]),
+            )
+
+        incoming.refresh_from_db()
+        self.assertEqual(incoming.status, "generating")
+        self.assertEqual(incoming.draft_text, "")
+        self.assertEqual(incoming.draft_sources, [])
+
+    def test_unverified_link_in_text_is_rejected_despite_valid_sources(self):
+        for text in (
+            "Use https://evil.example/answer for help.",
+            "Use [this page](/made-up-article) for help.",
+            '<a href="https://evil.example/answer">Instructions</a>',
+        ):
+            with self.subTest(text=text):
+                incoming = self.create_request()
+                dispatch_token = self.reserve_one(incoming)
+                claimed = claim_generation(incoming.pk, dispatch_token)
+
+                with self.assertRaises(PermanentGenerationError):
+                    finish_generation(
+                        incoming.pk,
+                        claimed.processing_token,
+                        Draft(text=text, sources=self.draft.sources),
+                    )
+
+                incoming.refresh_from_db()
+                self.assertEqual(incoming.status, "generating")
+                self.assertEqual(incoming.draft_text, "")
+                self.assertEqual(incoming.draft_sources, [])
+                # Keep only this subtest's record in flight while the next one
+                # obtains its independent queue reservation.
+                incoming.delete()
+
+    def test_rate_limit_deferrals_preserve_budgets_and_wait_until_permitted(self):
+        incoming = self.create_request()
+
+        def limited_generator(request):
+            self.assertFalse(connection.in_atomic_block)
+            raise DeferredGenerationError("Rate limiter warming up", retry_after=156)
+
+        for _ in range(3):
+            self.make_due(incoming)
+            token = self.reserve_one(incoming)
+            before = timezone.now()
+
+            self.assertEqual(
+                run_generation(incoming.pk, token, generator=limited_generator),
+                "pending",
+            )
+
+            incoming.refresh_from_db()
+            self.assertEqual(incoming.status, "pending")
+            self.assertEqual(incoming.attempt_count, 0)
+            self.assertEqual(incoming.dispatch_count, 0)
+            self.assertGreaterEqual(
+                incoming.next_attempt_at, before + timedelta(seconds=156)
+            )
+            self.assertIn("Rate limiter warming up", incoming.last_error)
+            self.assertIsNone(incoming.processing_token)
+            self.assertIsNone(incoming.lease_expires_at)
+            self.assertEqual(reserve_generation(), [])
+
+        self.make_due(incoming)
+        token = self.reserve_one(incoming)
+        self.assertEqual(
+            run_generation(incoming.pk, token, generator=lambda request: self.draft),
+            "review",
+        )
+        incoming.refresh_from_db()
+        self.assertEqual(incoming.attempt_count, 1)
+        self.assertEqual(incoming.dispatch_count, 1)
+        self.assertEqual(incoming.draft_text, self.draft.text)
 
     def test_claim_rotates_the_token_and_counts_one_execution_attempt(self):
         incoming = self.create_request()
@@ -405,7 +501,8 @@ class GenerationProcessingTests(TransactionTestCase):
         self.assertEqual(incoming.attempt_count, 1)
         self.assertEqual(incoming.draft_text, self.draft.text)
 
-    def test_unconfigured_generator_cannot_create_a_fake_success(self):
+    @override_settings(LLM_PROVIDER="unsupported")
+    def test_unsupported_generator_cannot_create_a_fake_success(self):
         incoming = self.create_request()
         dispatch_token = self.reserve_one(incoming)
 
@@ -415,7 +512,7 @@ class GenerationProcessingTests(TransactionTestCase):
         self.assertEqual(incoming.status, "failed")
         self.assertEqual(incoming.draft_text, "")
         self.assertEqual(incoming.draft_sources, [])
-        self.assertIn("not configured", incoming.last_error)
+        self.assertIn("Unsupported", incoming.last_error)
 
     def test_beat_tick_runs_the_reconciler_without_queuing_tick_tasks(self):
         from support.scheduling import DatabaseReconciliationScheduler

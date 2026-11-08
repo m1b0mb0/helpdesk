@@ -6,7 +6,12 @@ from django.conf import settings
 from django.db import DatabaseError, connection, transaction
 from django.utils import timezone
 
-from .generation import Draft, PermanentGenerationError, generate_draft
+from .generation import (
+    DeferredGenerationError,
+    PermanentGenerationError,
+    generate_draft,
+    validate_draft,
+)
 from .models import SupportRequest
 
 
@@ -17,7 +22,7 @@ def _backoff(count):
     )
 
 
-def _defer_locked(row, reason, now, permanent=False):
+def _defer_locked(row, reason, now, permanent=False, retry_after=0):
     count = row.attempt_count if row.status == row.Status.GENERATING else row.dispatch_count
     exhausted = (
         permanent
@@ -26,7 +31,7 @@ def _defer_locked(row, reason, now, permanent=False):
     )
     row.status = row.Status.FAILED if exhausted else row.Status.PENDING
     row.last_error = reason[:2000]
-    row.next_attempt_at = now + timedelta(seconds=_backoff(count))
+    row.next_attempt_at = now + timedelta(seconds=max(_backoff(count), retry_after))
     row.processing_token = None
     row.lease_expires_at = None
     row.save(
@@ -116,15 +121,7 @@ def claim_generation(request_id, dispatch_token):
 
 
 def finish_generation(request_id, run_token, draft):
-    if (
-        not isinstance(draft, Draft)
-        or not isinstance(draft.text, str)
-        or not draft.text.strip()
-        or not isinstance(draft.sources, list)
-        or not draft.sources
-        or any(not isinstance(source, dict) for source in draft.sources)
-    ):
-        raise PermanentGenerationError("Generator returned an invalid draft or sources.")
+    validate_draft(draft)
     return bool(SupportRequest.objects.filter(
         pk=request_id,
         status=SupportRequest.Status.GENERATING,
@@ -152,7 +149,34 @@ def fail_generation(request_id, run_token, error, permanent=False):
         ).first()
         if row is None:
             return "stale"
-        return _defer_locked(row, f"{type(error).__name__}: {error}", now, permanent)
+        return _defer_locked(
+            row, f"{type(error).__name__}: {error}", now, permanent,
+            retry_after=getattr(error, "retry_after", 0),
+        )
+
+
+def defer_generation(request_id, run_token, error):
+    """Limiter capacity/outage is waiting, not a failed HTTP execution attempt."""
+    now = timezone.now()
+    with transaction.atomic():
+        row = SupportRequest.objects.select_for_update().filter(
+            pk=request_id, status=SupportRequest.Status.GENERATING,
+            processing_token=run_token, lease_expires_at__gt=now,
+        ).first()
+        if row is None:
+            return "stale"
+        row.status = row.Status.PENDING
+        row.attempt_count = max(0, row.attempt_count - 1)
+        row.dispatch_count = max(0, row.dispatch_count - 1)
+        row.processing_token = None
+        row.lease_expires_at = None
+        row.last_error = f"{type(error).__name__}: {error}"[:2000]
+        row.next_attempt_at = now + timedelta(seconds=max(5, error.retry_after))
+        row.save(update_fields=[
+            "status", "attempt_count", "dispatch_count", "processing_token",
+            "lease_expires_at", "last_error", "next_attempt_at", "updated_at",
+        ])
+        return row.status
 
 
 def run_generation(request_id, dispatch_token, generator=None):
@@ -169,6 +193,8 @@ def run_generation(request_id, dispatch_token, generator=None):
         # A failed/uncertain write is recovered from its persisted lease, not a
         # second competing Celery retry mechanism.
         raise
+    except DeferredGenerationError as error:
+        return defer_generation(row.pk, row.processing_token, error)
     except PermanentGenerationError as error:
         return fail_generation(row.pk, row.processing_token, error, permanent=True)
     except Exception as error:
