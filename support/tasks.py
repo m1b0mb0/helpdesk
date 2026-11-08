@@ -3,6 +3,7 @@ from django.contrib.auth import get_user_model
 from django.db import connection
 
 from .processing import run_generation
+from .delivery import run_delivery
 
 
 @shared_task
@@ -17,3 +18,8 @@ def check_database():
 @shared_task
 def generate_reply(request_id, dispatch_token):
     return run_generation(request_id, dispatch_token)
+
+
+@shared_task
+def deliver_reply(request_id, dispatch_token):
+    return run_delivery(request_id, dispatch_token)
