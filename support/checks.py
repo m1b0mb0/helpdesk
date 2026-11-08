@@ -1,3 +1,5 @@
+from urllib.parse import urlsplit
+
 from django.conf import settings
 from django.core.checks import Error, register
 
@@ -37,4 +39,27 @@ def check_generation_configuration(app_configs, **kwargs):
         and settings.CELERY_WORKER_CANCEL_LONG_RUNNING_TASKS_ON_CONNECTION_LOSS
     ):
         errors.append(Error("Generation requires late ACK, worker-loss rejection, prefetch 1 and cancellation on broker loss.", id="support.E004"))
+    if not (
+        0 < settings.LLM_HTTP_TIMEOUT <= 20
+        and 5 <= settings.LLM_DEMO_DELAY_SECONDS <= 25
+        and max(settings.LLM_HTTP_TIMEOUT, settings.LLM_DEMO_DELAY_SECONDS) + 5
+        < settings.CELERY_TASK_SOFT_TIME_LIMIT
+    ):
+        errors.append(Error(
+            "Require HTTP timeout <=20s, demo delay 5..25s and 5s margin before soft task limit.",
+            id="support.E005",
+        ))
+    try:
+        origin = urlsplit(settings.PUBLIC_BASE_URL)
+        valid_origin = (
+            origin.scheme in {"http", "https"} and origin.hostname
+            and not origin.username and not origin.password
+            and origin.path in {"", "/"} and not origin.query and not origin.fragment
+            and not any(c.isspace() for c in settings.PUBLIC_BASE_URL)
+        )
+        origin.port  # Reject malformed ports too.
+    except ValueError:
+        valid_origin = False
+    if not valid_origin:
+        errors.append(Error("PUBLIC_BASE_URL must be a public HTTP(S) origin.", id="support.E006"))
     return errors
